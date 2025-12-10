@@ -15,7 +15,7 @@ It should work in Test and Classic mode.
 1. Join Quiz
 2. Open console and paste this
 ```ts
-fetch("https://raw.githubusercontent.com/leoaxo098/quizizz-cheat/master/dist/bundle.js")
+fetch("https://raw.githubusercontent.com/ShizukuFuru/quizizz-cheat/master/dist/bundle.js")
 .then((res) => res.text()
 .then((t) => eval(t)))
 ```
@@ -32,7 +32,7 @@ fetch("https://raw.githubusercontent.com/leoaxo098/quizizz-cheat/master/dist/bun
 1. Download [Stay](https://apps.apple.com/us/app/stay-for-safari/id1591620171)
 2. Follow the step in the app to install it to safari
 3. Click the + in the top right corner
-4. Press link then paste this in " https://raw.githubusercontent.com/Leoaxo098/quizizz-cheat/refs/heads/master/scripts/quizizz-cheat.js "
+4. Press link then paste this in " https://raw.githubusercontent.com/ShizukuFuru/quizizz-cheat/refs/heads/master/scripts/quizizz-cheat.js "
 
 
 As we can see on this screenshot, the answer **www.quizizz.com** has the "(correct anwser)" next to it indicating a valid answer.
