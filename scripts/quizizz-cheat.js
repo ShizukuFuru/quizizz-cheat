@@ -259,7 +259,7 @@
 
         button.addEventListener('click', () => {
             const code = input.value.replace(/\D/g, '');
-            if (code.length === 6) {
+            if (code.length >= 6) {
                 // Collapse GUI after submitting
                 const content = document.getElementById('quiz-gui-content');
                 const toggleBtn = document.getElementById('quiz-toggle-btn');
