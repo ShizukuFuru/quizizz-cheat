@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name          Quizizz Cheat
+// @name          Quizizz Cheat - Fixed v3
 // @namespace     https://github.com/leoaxo098
-// @version       4.1.0
-// @description   Multi-platform quiz helper with draggable, collapsible GUI
+// @version       5.2.0
+// @description   Fixed quiz helper with multiple answer support
 // @author        Leo
 // @match         https://quizizz.com/join/game/*
 // @match         https://wayground.com/join/*
@@ -17,37 +17,96 @@
     const DEBUG = true;
     let apiResponse = null;
     let mutationObserver = null;
+    let lastProcessedQuestion = '';
+    let isProcessing = false;
     let debounceTimer = null;
-    const MARKER_STYLE = 'color: #00ff00; font-weight: bold; font-size: 0.9em;';
-    const SIMILARITY_THRESHOLD = 0.6;
-
-    // Detect platform
-    const PLATFORM = {
-        isQuizizz: window.location.hostname.includes('quizizz.com'),
-        isWayground: window.location.hostname.includes('wayground.com')
-    };
 
     function log(...args) {
-        if(DEBUG) console.log('%c[QUIZ-HELPER]', 'color: #4CAF50; font-weight: bold', ...args);
+        if (DEBUG) console.log('%c[QUIZ-HELPER]', 'color: #4CAF50; font-weight: bold', ...args);
     }
 
-    // Create draggable input GUI
+    function stripHtml(html) {
+        if (!html) return '';
+        const tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        return tmp.textContent || tmp.innerText || '';
+    }
+
+    function extractText(element) {
+        if (!element) return '';
+        const clone = element.cloneNode(true);
+        clone.querySelectorAll('script, style, noscript, .quiz-correct-marker').forEach(el => el.remove());
+        return (clone.textContent || clone.innerText || '').trim();
+    }
+
+    function normalizeText(text) {
+        if (!text) return '';
+        return stripHtml(text)
+            .toLowerCase()
+            .trim()
+            .replace(/\s+/g, ' ')
+            .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ')
+            .replace(/['']/g, "'")
+            .replace(/[""]/g, '"')
+            .trim();
+    }
+
+    function hashText(text) {
+        const normalized = normalizeText(text);
+        let hash = 0;
+        for (let i = 0; i < normalized.length; i++) {
+            hash = ((hash << 5) - hash) + normalized.charCodeAt(i);
+            hash = hash & hash;
+        }
+        return hash.toString(36);
+    }
+
+    function getOptionText(option) {
+        if (!option) return '';
+        if (typeof option === 'string') return stripHtml(option);
+        if (option.text !== undefined) return stripHtml(String(option.text));
+        if (option.value !== undefined) return stripHtml(String(option.value));
+        if (option.content !== undefined) return stripHtml(String(option.content));
+        return '';
+    }
+
+    function getAnswerIndices(answer) {
+        if (!answer) return [];
+        let indices = answer.answer !== undefined ? answer.answer : answer.answers;
+        if (indices === undefined) return [];
+        if (!Array.isArray(indices)) indices = [indices];
+        return indices.filter(i => i !== null && i !== undefined);
+    }
+
+    function textsMatch(text1, text2) {
+        const n1 = normalizeText(text1);
+        const n2 = normalizeText(text2);
+        if (!n1 || !n2) return false;
+        if (n1 === n2) return true;
+        if (n1.includes(n2) || n2.includes(n1)) return true;
+        const clean1 = n1.replace(/[^a-z0-9]/g, '');
+        const clean2 = n2.replace(/[^a-z0-9]/g, '');
+        if (clean1 === clean2 && clean1.length > 0) return true;
+        return false;
+    }
+
     function createInputGUI() {
-        const platformName = PLATFORM.isQuizizz ? 'Quizizz' : 'Wayground';
         const gui = document.createElement('div');
         gui.id = 'quiz-input-gui';
         gui.innerHTML = `
-            <div id="quiz-gui-header" style="padding: 12px 15px; background: #4CAF50; color: white; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center; cursor: move; user-select: none; touch-action: none;">
-                <span style="font-size: 14px;">🚀 ${platformName} Helper</span>
-                <button id="quiz-toggle-btn" style="background: none; border: none; color: white; font-size: 20px; cursor: pointer; padding: 0; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;">−</button>
+            <div id="quiz-gui-header" style="padding: 12px 15px; background: linear-gradient(135deg, #4CAF50, #45a049); color: white; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center; cursor: move; user-select: none;">
+                <span style="font-size: 14px; font-weight: 600;">🎯 Quiz Helper</span>
+                <button id="quiz-toggle-btn" style="background: none; border: none; color: white; font-size: 20px; cursor: pointer; padding: 0; width: 24px; height: 24px; line-height: 24px;">−</button>
             </div>
-            <div id="quiz-gui-content" style="padding: 15px; text-align: center; background: white; border-radius: 0 0 8px 8px;">
-                <input type="text" id="quiz-code-input" placeholder="6-digit code"
-                    style="width: 100%; padding: 10px; margin-bottom: 12px; border: 2px solid #4CAF50; border-radius: 5px; text-align: center; font-size: 16px; box-sizing: border-box;">
+            <div id="quiz-gui-content" style="padding: 15px; background: white; border-radius: 0 0 8px 8px;">
+                <input type="text" id="quiz-code-input" placeholder="Enter quiz code"
+                    style="width: 100%; padding: 10px; margin-bottom: 10px; border: 2px solid #4CAF50; border-radius: 5px; text-align: center; font-size: 16px; box-sizing: border-box; outline: none;">
                 <button id="quiz-submit-btn"
-                    style="width: 100%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: 500;">
+                    style="width: 100%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; font-weight: 600;">
                     Load Answers
                 </button>
+                <div id="quiz-status" style="margin-top: 10px; font-size: 12px; color: #666; text-align: center; min-height: 18px;"></div>
+                <div id="quiz-answer-display" style="margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px; font-size: 13px; display: none; max-height: 200px; overflow-y: auto; word-wrap: break-word;"></div>
             </div>
         `;
 
@@ -55,48 +114,40 @@
             position: fixed;
             top: 20px;
             right: 20px;
-            z-index: 999999;
-            min-width: 280px;
-            max-width: 90vw;
+            z-index: 2147483647;
+            min-width: 300px;
+            max-width: 400px;
             border-radius: 8px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.3);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            transition: all 0.3s ease;
         `;
 
         document.body.appendChild(gui);
-
-        // Make draggable
         makeDraggable(gui);
-
-        // Make collapsible
         makeCollapsible(gui);
-
         return gui;
     }
 
-    // Draggable functionality
     function makeDraggable(element) {
         const header = element.querySelector('#quiz-gui-header');
         let isDragging = false;
         let currentX, currentY, initialX, initialY;
         let xOffset = 0, yOffset = 0;
 
-        // Get stored position or use default
         const storedPos = localStorage.getItem('quiz-helper-position');
         if (storedPos) {
-            const pos = JSON.parse(storedPos);
-            element.style.left = pos.x + 'px';
-            element.style.top = pos.y + 'px';
-            element.style.right = 'auto';
-            xOffset = pos.x;
-            yOffset = pos.y;
+            try {
+                const pos = JSON.parse(storedPos);
+                element.style.left = pos.x + 'px';
+                element.style.top = pos.y + 'px';
+                element.style.right = 'auto';
+                xOffset = pos.x;
+                yOffset = pos.y;
+            } catch (e) {}
         }
 
         function dragStart(e) {
-            // Prevent dragging when clicking the toggle button
             if (e.target.id === 'quiz-toggle-btn') return;
-
             if (e.type === "touchstart") {
                 initialX = e.touches[0].clientX - xOffset;
                 initialY = e.touches[0].clientY - yOffset;
@@ -104,15 +155,12 @@
                 initialX = e.clientX - xOffset;
                 initialY = e.clientY - yOffset;
             }
-
             isDragging = true;
-            header.style.cursor = 'grabbing';
         }
 
         function drag(e) {
             if (!isDragging) return;
             e.preventDefault();
-
             if (e.type === "touchmove") {
                 currentX = e.touches[0].clientX - initialX;
                 currentY = e.touches[0].clientY - initialY;
@@ -120,18 +168,11 @@
                 currentX = e.clientX - initialX;
                 currentY = e.clientY - initialY;
             }
-
             xOffset = currentX;
             yOffset = currentY;
-
-            // Keep within viewport bounds
             const rect = element.getBoundingClientRect();
-            const maxX = window.innerWidth - rect.width;
-            const maxY = window.innerHeight - rect.height;
-
-            xOffset = Math.max(0, Math.min(xOffset, maxX));
-            yOffset = Math.max(0, Math.min(yOffset, maxY));
-
+            xOffset = Math.max(0, Math.min(xOffset, window.innerWidth - rect.width));
+            yOffset = Math.max(0, Math.min(yOffset, window.innerHeight - rect.height));
             element.style.left = xOffset + 'px';
             element.style.top = yOffset + 'px';
             element.style.right = 'auto';
@@ -140,466 +181,466 @@
         function dragEnd() {
             if (isDragging) {
                 isDragging = false;
-                header.style.cursor = 'move';
-
-                // Save position
-                localStorage.setItem('quiz-helper-position', JSON.stringify({
-                    x: xOffset,
-                    y: yOffset
-                }));
+                localStorage.setItem('quiz-helper-position', JSON.stringify({ x: xOffset, y: yOffset }));
             }
         }
 
-        // Mouse events
         header.addEventListener('mousedown', dragStart);
         document.addEventListener('mousemove', drag);
         document.addEventListener('mouseup', dragEnd);
-
-        // Touch events for mobile
         header.addEventListener('touchstart', dragStart, { passive: false });
         document.addEventListener('touchmove', drag, { passive: false });
         document.addEventListener('touchend', dragEnd);
     }
 
-    // Collapsible functionality
     function makeCollapsible(element) {
         const toggleBtn = element.querySelector('#quiz-toggle-btn');
         const content = element.querySelector('#quiz-gui-content');
         let isCollapsed = localStorage.getItem('quiz-helper-collapsed') === 'true';
 
-        function toggleCollapse() {
-            isCollapsed = !isCollapsed;
-
-            if (isCollapsed) {
-                content.style.display = 'none';
-                toggleBtn.textContent = '+';
-                element.style.minWidth = '200px';
-            } else {
-                content.style.display = 'block';
-                toggleBtn.textContent = '−';
-                element.style.minWidth = '280px';
-            }
-
-            localStorage.setItem('quiz-helper-collapsed', isCollapsed);
-        }
-
-        // Set initial state
         if (isCollapsed) {
             content.style.display = 'none';
             toggleBtn.textContent = '+';
-            element.style.minWidth = '200px';
         }
 
-        toggleBtn.addEventListener('click', toggleCollapse);
-
-        // Prevent drag when clicking button
-        toggleBtn.addEventListener('mousedown', (e) => e.stopPropagation());
-        toggleBtn.addEventListener('touchstart', (e) => e.stopPropagation());
-    }
-
-    // Show notification
-    function showNotification(message, type = 'info') {
-        const colors = {
-            info: '#4CAF50',
-            error: '#f44336',
-            warning: '#ff9800'
+        toggleBtn.onclick = (e) => {
+            e.stopPropagation();
+            isCollapsed = !isCollapsed;
+            content.style.display = isCollapsed ? 'none' : 'block';
+            toggleBtn.textContent = isCollapsed ? '+' : '−';
+            localStorage.setItem('quiz-helper-collapsed', isCollapsed);
         };
+    }
 
-        const notification = document.createElement('div');
-        notification.textContent = message;
-        notification.style.cssText = `
-            position: fixed;
-            top: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            z-index: 999999;
-            background: ${colors[type]};
-            color: white;
-            padding: 12px 20px;
-            border-radius: 5px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    function showNotification(message, type = 'info') {
+        document.querySelectorAll('.quiz-notification').forEach(n => n.remove());
+        const colors = { info: '#4CAF50', error: '#f44336', warning: '#ff9800', success: '#2196F3' };
+        const notif = document.createElement('div');
+        notif.className = 'quiz-notification';
+        notif.textContent = message;
+        notif.style.cssText = `
+            position: fixed; top: 70px; left: 50%; transform: translateX(-50%);
+            z-index: 2147483647; background: ${colors[type] || colors.info}; color: white;
+            padding: 12px 24px; border-radius: 5px; box-shadow: 0 2px 10px rgba(0,0,0,0.3);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            animation: slideDown 0.3s ease-out;
-            max-width: 80vw;
-            text-align: center;
+            font-size: 14px; font-weight: 500; max-width: 80%; text-align: center;
         `;
-
-        document.body.appendChild(notification);
-        setTimeout(() => {
-            notification.style.animation = 'slideUp 0.3s ease-out';
-            setTimeout(() => notification.remove(), 300);
-        }, 3000);
+        document.body.appendChild(notif);
+        setTimeout(() => notif.remove(), 3000);
     }
 
-    // Add CSS animations
-    GM_addStyle(`
-        @keyframes slideDown {
-            from { transform: translateX(-50%) translateY(-100px); opacity: 0; }
-            to { transform: translateX(-50%) translateY(0); opacity: 1; }
+    function updateStatus(message, color = '#666') {
+        const status = document.getElementById('quiz-status');
+        if (status) {
+            status.textContent = message;
+            status.style.color = color;
         }
-        @keyframes slideUp {
-            from { transform: translateX(-50%) translateY(0); opacity: 1; }
-            to { transform: translateX(-50%) translateY(-100px); opacity: 0; }
-        }
-        #quiz-toggle-btn:hover {
-            background: rgba(255,255,255,0.2) !important;
-            border-radius: 4px;
-        }
-        #quiz-submit-btn:active {
-            transform: scale(0.98);
-        }
-    `);
-
-    // Initialize the script
-    function initialize() {
-        log('Initializing on platform:', PLATFORM.isQuizizz ? 'Quizizz' : 'Wayground');
-        const gui = createInputGUI();
-        const input = document.getElementById('quiz-code-input');
-        const button = document.getElementById('quiz-submit-btn');
-
-        button.addEventListener('click', () => {
-            const code = input.value.replace(/\D/g, '');
-            if (code.length >= 6) {
-                // Collapse GUI after submitting
-                const content = document.getElementById('quiz-gui-content');
-                const toggleBtn = document.getElementById('quiz-toggle-btn');
-                content.style.display = 'none';
-                toggleBtn.textContent = '+';
-                localStorage.setItem('quiz-helper-collapsed', 'true');
-
-                loadAnswers(code);
-            } else {
-                input.style.borderColor = '#ff4444';
-                showNotification('Please enter a valid 6-digit code', 'error');
-                setTimeout(() => input.style.borderColor = '#4CAF50', 1000);
-            }
-        });
-
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') button.click();
-        });
-
-        // Focus input when expanding
-        const toggleBtn = document.getElementById('quiz-toggle-btn');
-        toggleBtn.addEventListener('click', () => {
-            setTimeout(() => {
-                if (document.getElementById('quiz-gui-content').style.display !== 'none') {
-                    input.focus();
-                }
-            }, 100);
-        });
     }
 
-    // Load answers from API
+    function showAnswerInGUI(questionText, answers) {
+        const display = document.getElementById('quiz-answer-display');
+        if (!display) return;
+        display.style.display = 'block';
+        display.innerHTML = `
+            <div style="margin-bottom: 8px; color: #333; font-weight: 600; font-size: 12px;">Question:</div>
+            <div style="color: #666; font-size: 11px; margin-bottom: 10px; padding: 5px; background: #fff; border-radius: 3px;">${questionText.substring(0, 150)}${questionText.length > 150 ? '...' : ''}</div>
+            <div style="color: #4CAF50; font-weight: 600; font-size: 12px; margin-bottom: 5px;">✓ Correct Answer(s):</div>
+            ${answers.map(a => `<div style="color: #2e7d32; padding: 5px; background: rgba(76,175,80,0.1); border-radius: 3px; margin: 3px 0; font-size: 12px;">${a}</div>`).join('')}
+        `;
+    }
+
+    // Original fetching method
     function loadAnswers(code) {
-        log(`Loading answers for code: ${code}`);
-        showNotification('Loading answers...', 'info');
+        log('Loading answers for code:', code);
+        const submitBtn = document.getElementById('quiz-submit-btn');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Loading...';
+        updateStatus('Fetching answers...', '#666');
 
         GM_xmlhttpRequest({
             method: 'GET',
             url: `https://api.cheatnetwork.eu/quizizz/${code}/answers`,
             timeout: 15000,
             onload: function(response) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Load Answers';
+
                 if (response.status === 200) {
                     try {
                         apiResponse = JSON.parse(response.responseText);
                         if (apiResponse && apiResponse.answers && Array.isArray(apiResponse.answers)) {
                             log('Loaded', apiResponse.answers.length, 'questions');
-                            showNotification(`Loaded ${apiResponse.answers.length} questions!`, 'info');
+
+                            // Debug log
+                            apiResponse.answers.forEach((q, i) => {
+                                const indices = getAnswerIndices(q);
+                                const texts = indices.map(idx => getOptionText(q.options?.[idx]));
+                                log(`Q${i+1}: "${(q.question || '').substring(0, 40)}..." → [${indices}] = "${texts.join(', ')}"`);
+                            });
+
+                            showNotification(`✓ Loaded ${apiResponse.answers.length} questions`, 'info');
+                            updateStatus(`Ready: ${apiResponse.answers.length} questions`, '#4CAF50');
                             initializeAnswerSystem();
+
+                            // Auto collapse
+                            document.getElementById('quiz-gui-content').style.display = 'none';
+                            document.getElementById('quiz-toggle-btn').textContent = '+';
+                            localStorage.setItem('quiz-helper-collapsed', 'true');
                         } else {
                             showNotification('Invalid response format', 'error');
-                            log('Invalid response structure:', apiResponse);
+                            updateStatus('Invalid format', '#f44336');
+                            log('Invalid response:', apiResponse);
                         }
-                    } catch(e) {
+                    } catch (e) {
                         showNotification('Failed to parse response', 'error');
+                        updateStatus('Parse error', '#f44336');
                         log('Parse error:', e);
                     }
                 } else {
                     showNotification(`Server error: ${response.status}`, 'error');
+                    updateStatus(`Error: ${response.status}`, '#f44336');
                     log('HTTP error:', response.status);
                 }
             },
             onerror: function(err) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Load Answers';
                 showNotification('Network error - check connection', 'error');
+                updateStatus('Network error', '#f44336');
                 log('Network error:', err);
             },
             ontimeout: function() {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Load Answers';
                 showNotification('Request timed out', 'error');
+                updateStatus('Timeout', '#f44336');
                 log('Request timeout');
             }
         });
     }
 
-    // Answer processing system
     function initializeAnswerSystem() {
         log('Initializing answer system');
 
-        // Create floating action button
-        const fab = document.createElement('div');
-        fab.innerHTML = '🎯';
-        fab.title = 'Mark correct answers';
-        fab.style.cssText = `
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            z-index: 999998;
-            width: 56px;
-            height: 56px;
-            background: #4CAF50;
-            color: white;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 28px;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
-            cursor: pointer;
-            transition: all 0.3s ease;
-        `;
+        if (mutationObserver) mutationObserver.disconnect();
 
-        fab.addEventListener('mouseenter', () => {
-            fab.style.transform = 'scale(1.1)';
-            fab.style.boxShadow = '0 6px 15px rgba(0,0,0,0.4)';
-        });
-
-        fab.addEventListener('mouseleave', () => {
-            fab.style.transform = 'scale(1)';
-            fab.style.boxShadow = '0 4px 10px rgba(0,0,0,0.3)';
-        });
-
-        fab.addEventListener('click', () => {
-            processQuestion();
-            fab.style.background = '#2196F3';
-            setTimeout(() => fab.style.background = '#4CAF50', 300);
-        });
-
-        // Touch feedback for mobile
-        fab.addEventListener('touchstart', () => {
-            fab.style.transform = 'scale(0.95)';
-        });
-
-        fab.addEventListener('touchend', () => {
-            fab.style.transform = 'scale(1)';
-        });
-
-        document.body.appendChild(fab);
-
-        // Start monitoring for questions with debounce
         mutationObserver = new MutationObserver(() => {
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => processQuestion(), 200);
+            if (!isProcessing) {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => processQuestion(), 200);
+            }
         });
 
-        mutationObserver.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
+        mutationObserver.observe(document.body, { childList: true, subtree: true });
 
-        // Initial process
         processQuestion();
+        setTimeout(() => processQuestion(), 500);
+        setTimeout(() => processQuestion(), 1000);
+        setTimeout(() => processQuestion(), 2000);
     }
 
     function processQuestion() {
-        if (!apiResponse || !apiResponse.answers) {
-            log('API response not ready');
-            return;
-        }
+        if (!apiResponse || !apiResponse.answers || isProcessing) return;
+        isProcessing = true;
 
-        // Platform-specific selectors
-        const selectors = [
-            '.question-text-color',
-            '[class*="question-text"]',
-            '[class*="questionText"]',
-            '.question-content',
-            '[data-testid="question-text"]'
-        ];
+        try {
+            const questionSelectors = [
+                '.question-text-color',
+                '[class*="QuestionText"]',
+                '[class*="questionText"]',
+                '[class*="question-text"]',
+                '[data-testid*="question"]',
+                '.question-content',
+                '[class*="prompt"]',
+                '[role="heading"]'
+            ];
 
-        let questionElement = null;
-        for (const selector of selectors) {
-            questionElement = document.querySelector(selector);
-            if (questionElement) break;
-        }
+            let questionElement = null;
+            let questionText = '';
 
-        if (!questionElement) {
-            log('Question element not found');
-            return;
-        }
+            for (const selector of questionSelectors) {
+                try {
+                    const elements = document.querySelectorAll(selector);
+                    for (const el of elements) {
+                        const text = extractText(el);
+                        if (text) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                questionElement = el;
+                                questionText = text;
+                                break;
+                            }
+                        }
+                    }
+                } catch (e) {}
+                if (questionElement) break;
+            }
 
-        const questionText = normalizeText(questionElement.textContent);
-        if (!questionText) return;
+            if (!questionElement || !questionText) {
+                isProcessing = false;
+                return;
+            }
 
-        log('Processing question:', questionText.substring(0, 50) + '...');
+            const questionHash = hashText(questionText);
+            if (questionHash === lastProcessedQuestion) {
+                isProcessing = false;
+                return;
+            }
 
-        const match = findAnswerMatch(questionText);
-        if (match) {
-            markAnswers(match);
-        } else {
-            log('No match found for question');
+            lastProcessedQuestion = questionHash;
+            log('Processing:', questionText.substring(0, 80));
+
+            const match = findMatch(questionText);
+            if (match) {
+                markCorrectAnswers(match, questionText);
+            } else {
+                log('No match found');
+                clearPreviousMarkers();
+                updateStatus('No match found', '#ff9800');
+            }
+
+        } catch (error) {
+            log('Error:', error);
+        } finally {
+            isProcessing = false;
         }
     }
 
-    function findAnswerMatch(question) {
-        if (!apiResponse || !apiResponse.answers) return null;
+    function findMatch(questionText) {
+        const normalizedQuestion = normalizeText(questionText);
 
         // Exact match
-        const exactMatch = apiResponse.answers.find(a =>
-            normalizeText(a.question) === question
-        );
-        if (exactMatch) {
-            log('Found exact match');
-            return exactMatch;
+        for (const answer of apiResponse.answers) {
+            if (!answer.question) continue;
+            if (normalizedQuestion === normalizeText(answer.question)) {
+                log('EXACT match');
+                return answer;
+            }
         }
 
-        // Fuzzy match with threshold
-        const fuzzyResult = apiResponse.answers.reduce((best, current) => {
-            const similarity = calculateSimilarity(question, normalizeText(current.question));
-            if (similarity > best.similarity) {
-                return { answer: current, similarity };
+        // Contains match
+        for (const answer of apiResponse.answers) {
+            if (!answer.question) continue;
+            const apiQ = normalizeText(answer.question);
+            if (normalizedQuestion.includes(apiQ) || apiQ.includes(normalizedQuestion)) {
+                log('CONTAINS match');
+                return answer;
             }
-            return best;
-        }, { answer: null, similarity: 0 });
+        }
 
-        if (fuzzyResult.similarity >= SIMILARITY_THRESHOLD) {
-            log('Found fuzzy match with similarity:', fuzzyResult.similarity.toFixed(2));
-            return fuzzyResult.answer;
+        // Alphanumeric match
+        const cleanQ = normalizedQuestion.replace(/[^a-z0-9]/g, '');
+        for (const answer of apiResponse.answers) {
+            if (!answer.question) continue;
+            const cleanApiQ = normalizeText(answer.question).replace(/[^a-z0-9]/g, '');
+            if (cleanQ === cleanApiQ && cleanQ.length > 3) {
+                log('ALPHANUMERIC match');
+                return answer;
+            }
+        }
+
+        // Word match (80%)
+        const words = normalizedQuestion.split(' ').filter(w => w.length > 2);
+        for (const answer of apiResponse.answers) {
+            if (!answer.question) continue;
+            const apiWords = normalizeText(answer.question).split(' ').filter(w => w.length > 2);
+            if (words.length > 0 && apiWords.length > 0) {
+                const matching = words.filter(w => apiWords.includes(w));
+                if (matching.length / Math.max(words.length, apiWords.length) >= 0.8) {
+                    log('WORD match');
+                    return answer;
+                }
+            }
         }
 
         return null;
     }
 
-    function markAnswers(answer) {
-        if (!answer || !answer.answer || !answer.options) {
-            log('Invalid answer object');
-            return;
-        }
+    function clearPreviousMarkers() {
+        document.querySelectorAll('[data-quiz-marked="true"]').forEach(el => {
+            el.dataset.quizMarked = 'false';
+            el.style.border = '';
+            el.style.boxShadow = '';
+            el.style.background = '';
+            el.style.outline = '';
+        });
+        document.querySelectorAll('.quiz-correct-marker').forEach(el => el.remove());
+    }
 
-        log('Marking answers for:', answer.question.substring(0, 50) + '...');
+    function markCorrectAnswers(answer, questionText) {
+        clearPreviousMarkers();
 
-        const correctOptions = answer.answer.map(i => {
-            if (answer.options[i] && answer.options[i].text) {
-                return normalizeText(answer.options[i].text);
+        const answerIndices = getAnswerIndices(answer);
+        log('Answer indices:', answerIndices);
+
+        if (answerIndices.length === 0) {
+            // Try direct answer
+            if (answer.correctAnswer || answer.correct) {
+                const direct = String(answer.correctAnswer || answer.correct);
+                showAnswerInGUI(questionText, [direct]);
+                updateStatus(`Answer: ${direct.substring(0, 50)}`, '#4CAF50');
+                highlightByText([normalizeText(direct)]);
+                return;
             }
-            return null;
-        }).filter(Boolean);
-
-        if (correctOptions.length === 0) {
-            log('No valid correct options found');
+            updateStatus('Could not find answer', '#f44336');
             return;
         }
 
-        // Platform-specific option selectors
+        const correctTexts = [];
+        const displayTexts = [];
+
+        answerIndices.forEach(index => {
+            if (answer.options && answer.options[index] !== undefined) {
+                const text = getOptionText(answer.options[index]);
+                if (text) {
+                    correctTexts.push(normalizeText(text));
+                    displayTexts.push(text);
+                }
+            }
+        });
+
+        log('Correct answers:', displayTexts);
+
+        if (correctTexts.length === 0) {
+            updateStatus('Could not extract answers', '#f44336');
+            return;
+        }
+
+        showAnswerInGUI(questionText, displayTexts);
+        updateStatus(`Found ${correctTexts.length} answer(s)`, '#4CAF50');
+        highlightByText(correctTexts);
+    }
+
+    function highlightByText(correctTexts) {
         const optionSelectors = [
             '.option',
-            '[class*="option-"]',
+            '[class*="option"]',
             '[class*="Option"]',
             '[data-testid*="option"]',
-            '.answer-choice'
+            '[data-testid*="Option"]',
+            '.answer-choice',
+            '[role="button"]',
+            '[class*="answer"]',
+            '[class*="Answer"]',
+            '[class*="choice"]',
+            '.resizeable'
         ];
 
         let options = [];
         for (const selector of optionSelectors) {
-            options = document.querySelectorAll(selector);
-            if (options.length > 0) break;
+            try {
+                const els = document.querySelectorAll(selector);
+                if (els.length >= 2) {
+                    options = els;
+                    log(`Found ${els.length} options with: ${selector}`);
+                    break;
+                }
+            } catch (e) {}
         }
 
-        let markedCount = 0;
-        options.forEach(option => {
-            // Try multiple text element selectors
-            const textSelectors = [
-                '.resizeable',
-                '[class*="option-text"]',
-                '[class*="optionText"]',
-                '[class*="text"]',
-                'span',
-                'div'
-            ];
+        if (options.length === 0) {
+            log('No options found');
+            return;
+        }
 
-            let textElement = null;
-            for (const selector of textSelectors) {
-                textElement = option.querySelector(selector);
-                if (textElement && textElement.textContent.trim()) break;
-            }
+        let marked = 0;
 
-            if (!textElement) {
-                textElement = option;
-            }
+        options.forEach((option, i) => {
+            const optionText = extractText(option);
+            const normalized = normalizeText(optionText);
 
-            // Skip if already marked
-            if (textElement.dataset.quizMarked === 'true') return;
+            log(`Option ${i + 1}: "${normalized.substring(0, 40)}"`);
 
-            const originalText = normalizeText(
-                textElement.textContent.replace(/\(correct answer\)/gi, '').trim()
-            );
+            const isCorrect = correctTexts.some(ct => textsMatch(normalized, ct));
 
-            if (correctOptions.includes(originalText)) {
-                const currentHTML = textElement.innerHTML;
-                textElement.innerHTML = `
-                    ${currentHTML.replace(/<span[^>]*>\(correct answer\)<\/span>/gi, '')}
-                    <span style="${MARKER_STYLE}">(correct answer)</span>
+            if (isCorrect) {
+                log(`✓ Marking option ${i + 1}`);
+
+                option.dataset.quizMarked = 'true';
+                option.style.cssText += `
+                    border: 3px solid #00ff00 !important;
+                    box-shadow: 0 0 20px rgba(0,255,0,0.6) !important;
+                    background: rgba(0,255,0,0.15) !important;
                 `;
-                textElement.dataset.quizMarked = 'true';
-                markedCount++;
 
-                // Highlight the entire option
-                option.style.border = '2px solid #00ff00';
-                option.style.boxShadow = '0 0 10px rgba(0,255,0,0.3)';
+                if (!option.querySelector('.quiz-correct-marker')) {
+                    const marker = document.createElement('div');
+                    marker.className = 'quiz-correct-marker';
+                    marker.textContent = '✓ CORRECT';
+                    marker.style.cssText = `
+                        position: absolute;
+                        top: 5px;
+                        right: 5px;
+                        background: #00ff00;
+                        color: #000;
+                        padding: 5px 10px;
+                        border-radius: 4px;
+                        font-size: 12px;
+                        font-weight: bold;
+                        z-index: 10000;
+                        pointer-events: none;
+                    `;
+
+                    const style = getComputedStyle(option);
+                    if (!['absolute', 'relative', 'fixed', 'sticky'].includes(style.position)) {
+                        option.style.position = 'relative';
+                    }
+                    option.appendChild(marker);
+                }
+
+                marked++;
             }
         });
 
-        if (markedCount > 0) {
-            log(`Marked ${markedCount} correct answer(s)`);
-            showNotification(`Found ${markedCount} correct answer(s)!`, 'info');
+        if (marked > 0) {
+            showNotification(`✓ Marked ${marked} correct answer(s)`, 'success');
+        } else {
+            showNotification('Answers shown in panel', 'warning');
         }
     }
 
-    // Utility functions
-    function normalizeText(text) {
-        if (!text) return '';
-        return text
-            .normalize('NFC')
-            .toLowerCase()
-            .trim()
-            .replace(/\s+/g, ' ')
-            .replace(/[^\w\s]/g, '');
-    }
+    function initialize() {
+        log('Initializing Quiz Helper v5.2.0');
 
-    function calculateSimilarity(str1, str2) {
-        const m = str1.length;
-        const n = str2.length;
+        createInputGUI();
+        const input = document.getElementById('quiz-code-input');
+        const button = document.getElementById('quiz-submit-btn');
 
-        if (m === 0) return n === 0 ? 1 : 0;
-        if (n === 0) return 0;
+        input.addEventListener('input', (e) => {
+            e.target.value = e.target.value.replace(/[^0-9a-zA-Z]/g, '');
+        });
 
-        const dp = Array(m + 1).fill().map(() => Array(n + 1).fill(0));
-
-        for (let i = 0; i <= m; i++) dp[i][0] = i;
-        for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-        for (let i = 1; i <= m; i++) {
-            for (let j = 1; j <= n; j++) {
-                const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
-                dp[i][j] = Math.min(
-                    dp[i - 1][j] + 1,
-                    dp[i][j - 1] + 1,
-                    dp[i - 1][j - 1] + cost
-                );
+        button.addEventListener('click', () => {
+            const code = input.value.trim();
+            if (code.length >= 5) {
+                loadAnswers(code);
+            } else {
+                input.style.borderColor = '#f44336';
+                showNotification('Enter a valid quiz code', 'error');
+                setTimeout(() => input.style.borderColor = '#4CAF50', 1500);
             }
-        }
+        });
 
-        const maxLen = Math.max(m, n);
-        return 1 - (dp[m][n] / maxLen);
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') button.click();
+        });
     }
 
-    // Cleanup on page unload
     window.addEventListener('beforeunload', () => {
-        if (mutationObserver) {
-            mutationObserver.disconnect();
-        }
+        if (mutationObserver) mutationObserver.disconnect();
         clearTimeout(debounceTimer);
     });
 
-    // Start the script
+    GM_addStyle(`
+        #quiz-submit-btn:hover { background: #45a049 !important; }
+        #quiz-submit-btn:disabled { background: #ccc !important; cursor: not-allowed !important; }
+        #quiz-toggle-btn:hover { background: rgba(255,255,255,0.2) !important; border-radius: 4px; }
+        .quiz-correct-marker { animation: quiz-pulse 1.5s infinite; }
+        @keyframes quiz-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.8; } }
+        [data-quiz-marked="true"] { animation: quiz-glow 2s infinite; }
+        @keyframes quiz-glow { 0%, 100% { box-shadow: 0 0 20px rgba(0,255,0,0.6); } 50% { box-shadow: 0 0 30px rgba(0,255,0,0.9); } }
+    `);
+
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', initialize);
     } else {
