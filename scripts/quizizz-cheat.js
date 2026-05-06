@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name          Quizizz Helper - Study Edition
-// @namespace     https://github.com/leoaxo098
+// @name          Quizizz Cheats - Study Edition
+// @namespace     https://github.com/ShizukuFuru
 // @version       7.5.0
-// @description   Sleek black UI quiz helper with study tools, practice, custom selection, and retry-wrong-questions
-// @author        Leo
+// @description   Sleek black UI quiz cheats with study tools, practice, custom selection, and retry-wrong-questions
+// @author        Furu
 // @match         https://quizizz.com/join/game/*
 // @match         https://quizizz.com/join/*
 // @match         https://wayground.com/join/*
@@ -1186,7 +1186,7 @@
             <div id="quiz-gui-header">
                 <div class="qh-title">
                     <span class="qh-logo">Q</span>
-                    <span>Quiz Helper</span>
+                    <span>Quiz AURA EZ KID!!!</span>
                     <span class="qh-version">v${VERSION}</span>
                 </div>
                 <div class="qh-header-actions">
