@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name          Quizizz Cheats - Study Edition
+// @name          Quizizz Helper - Study Edition
 // @namespace     https://github.com/ShizukuFuru
-// @version       7.5.0
-// @description   Sleek black UI quiz cheats with study tools, practice, custom selection, and retry-wrong-questions
+// @version       7.6.0
+// @description   Sleek black UI quiz helper with study tools, practice, custom selection, retry-wrong-questions, full-question view & image support
 // @author        Furu
 // @match         https://quizizz.com/join/game/*
 // @match         https://quizizz.com/join/*
@@ -20,7 +20,7 @@
     'use strict';
 
     const DEBUG = false;
-    const VERSION = '7.5.0';
+    const VERSION = '7.6.0';
     const STORAGE_KEY = 'quiz-helper-data-v7';
     const SAVE_DEBOUNCE_MS = 500;
 
@@ -37,6 +37,7 @@
     let statsInterval = null;
     let currentMatch = null;
     let currentQuestionText = '';
+    let currentQuestionImages = [];
     let helperEnabled = GM_getValue('helper-enabled', true);
     let activeTab = 'answer';
     let activePracticeSubTab = 'practice';
@@ -44,7 +45,7 @@
     let flashcardIndex = 0;
     let flashcardFlipped = false;
     let flashcardFilter = 'all';
-    let flashcardOrder = null; // null = natural; array of hashes = shuffled order
+    let flashcardOrder = null;
     let quizModeIndex = 0;
     let quizModeScore = 0;
     let quizModeAnswered = false;
@@ -54,12 +55,11 @@
     let stealthMode = GM_getValue('stealth-mode', false);
     let audioCtx = null;
 
-    // Custom tab state
     let customSelected = new Set();
     let customSearch = '';
-    let customMethod = 'practice'; // 'practice' | 'flashcard'
-    let customActive = false;       // a custom session is running
-    let customMode = null;          // 'practice' | 'flashcard' (active session mode)
+    let customMethod = 'practice';
+    let customActive = false;
+    let customMode = null;
     let customDeck = [];
     let customFlashIndex = 0;
     let customFlashFlipped = false;
@@ -87,6 +87,7 @@
                     if (q.quizizzWrongCount === undefined) q.quizizzWrongCount = 0;
                     if (q.quizizzLastWrong === undefined) q.quizizzLastWrong = null;
                     if (q.quizizzLastCorrect === undefined) q.quizizzLastCorrect = null;
+                    if (!Array.isArray(q.images)) q.images = [];
                 });
                 return data;
             }
@@ -110,12 +111,13 @@
         }, SAVE_DEBOUNCE_MS);
     }
 
-    function recordQuestion(hash, question, answers, allOptions, qType) {
+    function recordQuestion(hash, question, answers, allOptions, qType, images) {
         if (!studyData.seenQuestions[hash]) {
             studyData.seenQuestions[hash] = {
                 question, answers,
                 allOptions: allOptions || [],
                 qType: qType || 'mcq',
+                images: images || [],
                 seenCount: 0, correctCount: 0, wrongCount: 0,
                 quizizzWrongCount: 0,
                 quizizzLastWrong: null,
@@ -133,6 +135,8 @@
         q.question = question;
         q.allOptions = allOptions || q.allOptions || [];
         q.qType = qType || q.qType || 'mcq';
+        if (Array.isArray(images) && images.length) q.images = images;
+        else if (!Array.isArray(q.images)) q.images = [];
         if (!studyData.currentSession.questionHashes.includes(hash)) {
             studyData.currentSession.questionHashes.push(hash);
             studyData.currentSession.seen++;
@@ -252,6 +256,112 @@
         return t === 'multi' || t.includes('multi') || t === 'checkbox' || t.includes('select');
     }
 
+    /* ---------- IMAGE EXTRACTION ---------- */
+    function isLikelyImageUrl(s) {
+        if (!s || typeof s !== 'string') return false;
+        if (!/^https?:\/\//i.test(s) && !s.startsWith('//') && !s.startsWith('data:image')) return false;
+        return /\.(png|jpe?g|gif|webp|svg|bmp|avif)(\?|#|$)/i.test(s)
+            || /quizizz\.com\/.*\/(media|image|attachment)/i.test(s)
+            || s.startsWith('data:image');
+    }
+
+    function pushImg(arr, url) {
+        if (!url) return;
+        let u = String(url).trim();
+        if (!u) return;
+        if (u.startsWith('//')) u = 'https:' + u;
+        if (!isLikelyImageUrl(u) && !u.startsWith('http')) return;
+        if (!arr.includes(u)) arr.push(u);
+    }
+
+    function collectImagesFromValue(val, out) {
+        if (!val) return;
+        if (typeof val === 'string') {
+            if (isLikelyImageUrl(val)) pushImg(out, val);
+            return;
+        }
+        if (Array.isArray(val)) {
+            val.forEach(v => collectImagesFromValue(v, out));
+            return;
+        }
+        if (typeof val === 'object') {
+            // Common Quizizz media shapes
+            const keys = ['url', 'src', 'href', 'image', 'imageUrl', 'thumbnail', 'thumbnailUrl', 'preview', 'previewUrl'];
+            for (const k of keys) {
+                if (val[k] && typeof val[k] === 'string' && isLikelyImageUrl(val[k])) pushImg(out, val[k]);
+            }
+            // Type hints
+            const type = (val.type || val.kind || '').toString().toLowerCase();
+            if (type.includes('image') || type.includes('photo') || type.includes('picture')) {
+                if (val.url) pushImg(out, val.url);
+                if (val.src) pushImg(out, val.src);
+            }
+            // Recurse known containers
+            ['media', 'attachments', 'images', 'questionMedia', 'medias', 'files'].forEach(k => {
+                if (val[k]) collectImagesFromValue(val[k], out);
+            });
+        }
+    }
+
+    function extractQuestionImages(answer) {
+        const out = [];
+        if (!answer) return out;
+        // Direct fields
+        ['image', 'imageUrl', 'questionImage', 'questionImageUrl'].forEach(k => {
+            if (answer[k]) collectImagesFromValue(answer[k], out);
+        });
+        // Common containers
+        ['media', 'questionMedia', 'attachments', 'images', 'medias', 'files'].forEach(k => {
+            if (answer[k]) collectImagesFromValue(answer[k], out);
+        });
+        // structured.query / question wrapper
+        if (answer.structured) collectImagesFromValue(answer.structured, out);
+        if (answer.query) collectImagesFromValue(answer.query, out);
+        // Fallback: scan question html for <img>
+        const qStr = typeof answer.question === 'string' ? answer.question : '';
+        if (qStr.includes('<img')) {
+            const re = /<img[^>]+src=["']([^"']+)["']/gi;
+            let m; while ((m = re.exec(qStr)) !== null) pushImg(out, m[1]);
+        }
+        return out;
+    }
+
+    function extractImagesFromElement(el) {
+        const out = [];
+        if (!el) return out;
+        // Look at the question element and a couple ancestors for sibling images
+        const scopes = [el];
+        let p = el.parentElement;
+        for (let i = 0; i < 3 && p; i++) { scopes.push(p); p = p.parentElement; }
+        const seen = new Set();
+        for (const scope of scopes) {
+            scope.querySelectorAll('img').forEach(img => {
+                const r = img.getBoundingClientRect();
+                if (r.width < 24 || r.height < 24) return;
+                const src = img.currentSrc || img.src;
+                if (!src || seen.has(src)) return;
+                // Skip helper's own images
+                if (img.closest('#quiz-input-gui') || img.closest('#qh-floating-answer')) return;
+                seen.add(src);
+                pushImg(out, src);
+            });
+            // Also look for inline background images
+            scope.querySelectorAll('[style*="background-image"]').forEach(node => {
+                if (node.closest('#quiz-input-gui')) return;
+                const bg = (node.style.backgroundImage || '').match(/url\((['"]?)(.*?)\1\)/);
+                if (bg && bg[2]) {
+                    const r = node.getBoundingClientRect();
+                    if (r.width >= 40 && r.height >= 40 && !seen.has(bg[2])) {
+                        seen.add(bg[2]);
+                        pushImg(out, bg[2]);
+                    }
+                }
+            });
+            if (out.length) break;
+        }
+        return out;
+    }
+
     function levenshtein(a, b) {
         if (a === b) return 0;
         const al = a.length, bl = b.length;
@@ -331,6 +441,8 @@
             position: fixed; top: 20px; right: 20px;
             z-index: 2147483647;
             width: 340px;
+            max-height: calc(100vh - 40px);
+            display: flex; flex-direction: column;
             border-radius: 16px;
             background: var(--qh-bg);
             box-shadow: 0 30px 60px rgba(0,0,0,0.5), 0 0 0 1px var(--qh-border);
@@ -357,6 +469,7 @@
             display: flex; justify-content: space-between; align-items: center;
             cursor: move; user-select: none;
             position: relative;
+            flex-shrink: 0;
         }
         #quiz-gui-header::after {
             content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 1px;
@@ -407,7 +520,7 @@
             border-color: var(--qh-border-strong);
         }
 
-        .qh-tabs-wrap { position: relative; background: var(--qh-bg-elev); border-bottom: 1px solid var(--qh-border); }
+        .qh-tabs-wrap { position: relative; background: var(--qh-bg-elev); border-bottom: 1px solid var(--qh-border); flex-shrink: 0; }
         .qh-tabs {
             display: flex; padding: 0 28px; gap: 2px;
             overflow-x: auto; scroll-behavior: smooth; scrollbar-width: none;
@@ -490,9 +603,14 @@
         #quiz-gui-content {
             background: var(--qh-bg);
             transition: max-height 0.35s, opacity 0.25s;
-            overflow: hidden;
+            overflow-y: auto;
+            overflow-x: hidden;
+            flex: 1 1 auto;
+            min-height: 0;
         }
-        #quiz-gui-content.qh-collapsed { max-height: 0 !important; opacity: 0; }
+        #quiz-gui-content::-webkit-scrollbar { width: 8px; }
+        #quiz-gui-content::-webkit-scrollbar-thumb { background: var(--qh-border-strong); border-radius: 4px; }
+        #quiz-gui-content.qh-collapsed { max-height: 0 !important; opacity: 0; flex: 0 0 auto; }
 
         .qh-pane { display: none; padding: 16px; }
         .qh-pane.active { display: block; animation: qh-fadeIn 0.25s; }
@@ -579,12 +697,9 @@
             border-radius: 12px;
             font-size: 13px;
             display: none;
-            max-height: 320px; overflow-y: auto;
             word-wrap: break-word;
             animation: qh-fadeIn 0.3s;
         }
-        #quiz-answer-display::-webkit-scrollbar { width: 6px; }
-        #quiz-answer-display::-webkit-scrollbar-thumb { background: var(--qh-border-strong); border-radius: 3px; }
         .qh-q-label, .qh-a-label {
             font-size: 10px; font-weight: 700;
             text-transform: uppercase; letter-spacing: 0.8px;
@@ -600,7 +715,63 @@
             border-radius: 8px;
             border: 1px solid var(--qh-border);
             line-height: 1.5;
+            max-height: 240px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
         }
+        .qh-q-text::-webkit-scrollbar { width: 6px; }
+        .qh-q-text::-webkit-scrollbar-thumb { background: var(--qh-border-strong); border-radius: 3px; }
+
+        .qh-q-images {
+            margin-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .qh-q-image-wrap {
+            position: relative;
+            background: var(--qh-bg);
+            border: 1px solid var(--qh-border);
+            border-radius: 8px;
+            overflow: hidden;
+            cursor: zoom-in;
+        }
+        .qh-q-image-wrap img {
+            display: block;
+            width: 100%;
+            max-height: 220px;
+            object-fit: contain;
+            background: #000;
+        }
+        .qh-q-image-wrap .qh-img-label {
+            position: absolute; top: 6px; left: 6px;
+            background: rgba(0,0,0,0.6);
+            color: var(--qh-text);
+            font-size: 9px; font-weight: 700;
+            padding: 3px 7px; border-radius: 999px;
+            letter-spacing: 0.5px; text-transform: uppercase;
+            backdrop-filter: blur(6px);
+        }
+
+        #qh-img-lightbox {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.92);
+            z-index: 2147483647;
+            display: none;
+            align-items: center; justify-content: center;
+            cursor: zoom-out;
+            padding: 24px;
+        }
+        #qh-img-lightbox.show { display: flex; animation: qh-fadeIn 0.2s; }
+        #qh-img-lightbox img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: 8px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+        }
+
         .qh-answer-item {
             color: var(--qh-text);
             padding: 10px 12px;
@@ -612,6 +783,7 @@
             display: flex; align-items: flex-start; gap: 8px;
             animation: qh-slideRight 0.3s forwards;
             opacity: 0;
+            word-break: break-word;
         }
         .qh-answer-item:nth-child(1) { animation-delay: 0.05s; }
         .qh-answer-item:nth-child(2) { animation-delay: 0.10s; }
@@ -724,6 +896,14 @@
             font-size: 14px; line-height: 1.5;
             color: var(--qh-text); font-weight: 500;
             max-height: 150px; overflow-y: auto; width: 100%;
+        }
+        .qh-flashcard-img {
+            max-width: 100%;
+            max-height: 110px;
+            object-fit: contain;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            background: #000;
         }
         .qh-flash-answers {
             width: 100%; max-height: 170px; overflow-y: auto;
@@ -840,6 +1020,20 @@
             padding: 16px; margin-bottom: 10px;
             font-size: 14px; line-height: 1.5;
             min-height: 60px;
+            max-height: 260px;
+            overflow-y: auto;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+        .qh-quiz-question::-webkit-scrollbar { width: 6px; }
+        .qh-quiz-question::-webkit-scrollbar-thumb { background: var(--qh-border-strong); border-radius: 3px; }
+        .qh-quiz-question img.qh-q-inline-img {
+            max-width: 100%; max-height: 160px;
+            object-fit: contain;
+            border-radius: 6px;
+            margin-top: 8px;
+            background: #000;
+            display: block;
         }
         .qh-quiz-options { display: flex; flex-direction: column; gap: 6px; }
         .qh-quiz-option {
@@ -852,6 +1046,7 @@
             text-align: left; font-family: inherit;
             width: 100%;
             display: flex; align-items: center; gap: 10px;
+            word-break: break-word;
         }
         .qh-quiz-option:hover:not(:disabled) {
             border-color: var(--qh-text-soft);
@@ -987,6 +1182,14 @@
         .qh-list-item.has-wrongs {
             border-left: 3px solid var(--qh-error);
         }
+        .qh-list-item-row { display: flex; gap: 8px; align-items: flex-start; }
+        .qh-list-thumb {
+            width: 42px; height: 42px;
+            border-radius: 6px; flex-shrink: 0;
+            object-fit: cover;
+            background: #000;
+            border: 1px solid var(--qh-border);
+        }
         .qh-list-q { color: var(--qh-text); font-weight: 600; margin-bottom: 4px; line-height: 1.4; }
         .qh-list-a { color: var(--qh-success); font-size: 11px; opacity: 0.85; line-height: 1.4; }
         .qh-list-meta {
@@ -1000,7 +1203,6 @@
             color: var(--qh-text-dim); font-size: 13px;
         }
 
-        /* Custom tab specific */
         .qh-custom-item {
             background: var(--qh-bg-elev);
             border: 1px solid var(--qh-border);
@@ -1178,6 +1380,23 @@
         .qh-list-scroll { max-height: 320px; overflow-y: auto; padding-right: 4px; }
     `);
 
+    /* ---------- IMAGE LIGHTBOX ---------- */
+    function ensureLightbox() {
+        let lb = document.getElementById('qh-img-lightbox');
+        if (lb) return lb;
+        lb = document.createElement('div');
+        lb.id = 'qh-img-lightbox';
+        lb.innerHTML = `<img alt="">`;
+        lb.addEventListener('click', () => lb.classList.remove('show'));
+        document.body.appendChild(lb);
+        return lb;
+    }
+    function openLightbox(src) {
+        const lb = ensureLightbox();
+        lb.querySelector('img').src = src;
+        lb.classList.add('show');
+    }
+
     /* ---------- GUI ---------- */
     function createGUI() {
         const gui = document.createElement('div');
@@ -1244,7 +1463,9 @@
                         <div class="qh-flashcard-inner">
                             <div class="qh-flashcard-face front">
                                 <div class="qh-flashcard-tag">Question</div>
-                                <div class="qh-flashcard-text" id="qh-flash-q">Load a quiz to start</div>
+                                <div id="qh-flash-front-content" style="width:100%;flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:6px">
+                                    <div class="qh-flashcard-text" id="qh-flash-q">Load a quiz to start</div>
+                                </div>
                                 <div class="qh-flashcard-hint">Click to flip</div>
                             </div>
                             <div class="qh-flashcard-face back">
@@ -1427,6 +1648,16 @@
                         </div>
                         <label class="qh-switch">
                             <input type="checkbox" id="qh-floating-toggle" ${GM_getValue('floating-card', true) ? 'checked' : ''}>
+                            <span class="qh-switch-slider"></span>
+                        </label>
+                    </div>
+                    <div class="qh-setting-row">
+                        <div>
+                            <div class="qh-setting-label">Show question images</div>
+                            <div class="qh-setting-desc">Display images attached to the question</div>
+                        </div>
+                        <label class="qh-switch">
+                            <input type="checkbox" id="qh-images-toggle" ${GM_getValue('show-images', true) ? 'checked' : ''}>
                             <span class="qh-switch-slider"></span>
                         </label>
                     </div>
@@ -1627,7 +1858,22 @@
         status.style.color = c;
     }
 
-    function showAnswerInGUI(questionText, answers, type, isTyped) {
+    function buildImagesHtml(images) {
+        if (!images || !images.length) return '';
+        if (!GM_getValue('show-images', true)) return '';
+        return `
+            <div class="qh-q-images">
+                ${images.map((src, i) => `
+                    <div class="qh-q-image-wrap" data-img-src="${escapeHtml(src)}">
+                        <span class="qh-img-label">Image ${images.length > 1 ? (i + 1) : ''}</span>
+                        <img src="${escapeHtml(src)}" alt="Question image" loading="lazy">
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    function showAnswerInGUI(questionText, answers, type, isTyped, images) {
         const display = document.getElementById('quiz-answer-display');
         if (!display) return;
         const typeLabel = ({
@@ -1644,7 +1890,8 @@
                 <span class="qh-type-badge">${escapeHtml(typeLabel)}</span>
                 ${isTyped ? '<span class="qh-typed-indicator">Type it</span>' : ''}
             </div>
-            <div class="qh-q-text">${escapeHtml(questionText.substring(0, 240))}${questionText.length > 240 ? '…' : ''}</div>
+            <div class="qh-q-text">${escapeHtml(questionText)}</div>
+            ${buildImagesHtml(images)}
             <div class="qh-a-label">✓ Correct Answer${answers.length > 1 ? 's' : ''}</div>
             ${answers.map(a => `
                 <div class="qh-answer-item">
@@ -1652,6 +1899,11 @@
                     <span>${escapeHtml(a)}</span>
                 </div>`).join('')}
         `;
+
+        // Wire up image click-to-zoom
+        display.querySelectorAll('.qh-q-image-wrap').forEach(w => {
+            w.onclick = () => openLightbox(w.dataset.imgSrc);
+        });
     }
 
     function showFloatingAnswer(answers) {
@@ -1719,12 +1971,14 @@
                                     ? a.options.map(getOptionText).filter(Boolean)
                                     : [];
                                 const qType = getQuestionType(a);
+                                const images = extractQuestionImages(a);
                                 const h = hashText(a.question);
                                 if (!studyData.seenQuestions[h]) {
                                     studyData.seenQuestions[h] = {
                                         question: a.question,
                                         answers: displayTexts,
                                         allOptions, qType,
+                                        images,
                                         seenCount: 0, correctCount: 0, wrongCount: 0,
                                         quizizzWrongCount: 0,
                                         quizizzLastWrong: null,
@@ -1738,6 +1992,7 @@
                                     studyData.seenQuestions[h].allOptions = allOptions;
                                     studyData.seenQuestions[h].qType = qType;
                                     studyData.seenQuestions[h].answers = displayTexts;
+                                    if (images.length) studyData.seenQuestions[h].images = images;
                                 }
                                 studyData.currentSession.questionHashes.push(h);
                             });
@@ -1822,7 +2077,7 @@
         try {
             const found = findQuestionElement();
             if (!found) { isProcessing = false; return; }
-            const { text: questionText } = found;
+            const { el, text: questionText } = found;
             const qhash = hashText(questionText);
             currentQuestionText = questionText;
 
@@ -1835,6 +2090,9 @@
             lastProcessedQuestion = qhash;
             lastDetectedAnswerHash = null;
             hideFloatingAnswer();
+
+            // Capture any images visible near the question on the page
+            currentQuestionImages = extractImagesFromElement(el);
 
             const match = findMatch(questionText);
             if (match) {
@@ -2020,22 +2278,27 @@
         const type = getQuestionType(answer);
         const { correctTexts, displayTexts } = extractAnswers(answer);
 
+        // Combine API images with on-page images (dedupe)
+        const apiImages = extractQuestionImages(answer);
+        const merged = [];
+        [...apiImages, ...currentQuestionImages].forEach(u => { if (u && !merged.includes(u)) merged.push(u); });
+
         if (displayTexts.length === 0) {
             log('No answer extractable', answer);
             updateStatus('Could not extract answer', 'error');
-            showAnswerInGUI(questionText, ['(answer not available in API response)'], type, false);
+            showAnswerInGUI(questionText, ['(answer not available in API response)'], type, false, merged);
             return;
         }
 
         const isTyped = isTypedType(type);
 
-        showAnswerInGUI(questionText, displayTexts, type, isTyped);
+        showAnswerInGUI(questionText, displayTexts, type, isTyped, merged);
         updateStatus(`Found ${displayTexts.length} answer${displayTexts.length > 1 ? 's' : ''}`, 'success');
 
         const allOptions = Array.isArray(answer.options)
             ? answer.options.map(getOptionText).filter(Boolean)
             : [];
-        recordQuestion(hashText(questionText), questionText, displayTexts, allOptions, type);
+        recordQuestion(hashText(questionText), questionText, displayTexts, allOptions, type, merged);
         scheduleBadgeUpdate();
 
         const autoHighlight = GM_getValue('auto-highlight', true);
@@ -2116,19 +2379,29 @@
             container.innerHTML = `<div class="qh-empty">📚<br>No questions yet.<br><span style="font-size:11px">Load a quiz to start collecting.</span></div>`;
             return;
         }
+        const showImgs = GM_getValue('show-images', true);
         container.innerHTML = items.map(q => {
             const ansJoined = q.answers.join(' • ');
             const hasQuizizzWrong = q.quizizzLastWrong && !q.quizizzLastCorrect;
+            const thumb = showImgs && q.images && q.images.length
+                ? `<img class="qh-list-thumb" src="${escapeHtml(q.images[0])}" loading="lazy" alt="">`
+                : '';
             return `
             <div class="qh-list-item ${q.wrongCount > 0 || hasQuizizzWrong ? 'has-wrongs' : ''}" data-hash="${q.hash}">
-                <div class="qh-list-q">${q.starred ? '⭐ ' : ''}${escapeHtml(q.question.substring(0, 120))}${q.question.length > 120 ? '…' : ''}</div>
-                <div class="qh-list-a">→ ${escapeHtml(ansJoined.substring(0, 120))}${ansJoined.length > 120 ? '…' : ''}</div>
-                <div class="qh-list-meta">
-                    <span>👁 ${q.seenCount}×</span>
-                    ${q.correctCount ? `<span style="color:var(--qh-success)">✓ ${q.correctCount}</span>` : ''}
-                    ${q.wrongCount ? `<span class="qh-list-meta-wrong">✕ ${q.wrongCount}</span>` : ''}
-                    ${hasQuizizzWrong ? `<span class="qh-list-meta-wrong">🎮 wrong</span>` : ''}
-                    ${q.difficulty ? `<span>${['','😎 easy','😐 med','😓 hard'][q.difficulty]}</span>` : ''}
+                <div class="qh-list-item-row">
+                    ${thumb}
+                    <div style="flex:1;min-width:0">
+                        <div class="qh-list-q">${q.starred ? '⭐ ' : ''}${escapeHtml(q.question.substring(0, 120))}${q.question.length > 120 ? '…' : ''}</div>
+                        <div class="qh-list-a">→ ${escapeHtml(ansJoined.substring(0, 120))}${ansJoined.length > 120 ? '…' : ''}</div>
+                        <div class="qh-list-meta">
+                            <span>👁 ${q.seenCount}×</span>
+                            ${q.correctCount ? `<span style="color:var(--qh-success)">✓ ${q.correctCount}</span>` : ''}
+                            ${q.wrongCount ? `<span class="qh-list-meta-wrong">✕ ${q.wrongCount}</span>` : ''}
+                            ${hasQuizizzWrong ? `<span class="qh-list-meta-wrong">🎮 wrong</span>` : ''}
+                            ${q.images && q.images.length ? `<span>🖼 ${q.images.length}</span>` : ''}
+                            ${q.difficulty ? `<span>${['','😎 easy','😐 med','😓 hard'][q.difficulty]}</span>` : ''}
+                        </div>
+                    </div>
                 </div>
             </div>`;
         }).join('');
@@ -2151,7 +2424,6 @@
         else if (flashcardFilter === 'starred') filtered = items.filter(q => q.starred);
         else filtered = items;
 
-        // Apply shuffled order if set
         if (flashcardOrder && flashcardOrder.length) {
             const map = new Map(filtered.map(q => [q.hash, q]));
             const ordered = [];
@@ -2161,7 +2433,6 @@
                     map.delete(h);
                 }
             }
-            // Append any new items that aren't in the saved order
             for (const q of map.values()) ordered.push(q);
             return ordered;
         }
@@ -2172,13 +2443,14 @@
         const deck = getFlashcardDeck();
         const card = document.getElementById('qh-flashcard');
         const qEl = document.getElementById('qh-flash-q');
+        const frontContent = document.getElementById('qh-flash-front-content');
         const backTag = document.getElementById('qh-flash-back-tag');
         const backContent = document.getElementById('qh-flash-back-content');
         const counter = document.getElementById('qh-flash-counter');
         const progress = document.getElementById('qh-flash-progress');
         const starBtn = document.getElementById('qh-flash-star');
         if (!deck.length) {
-            qEl.textContent = 'No cards yet';
+            frontContent.innerHTML = `<div class="qh-flashcard-text" id="qh-flash-q">No cards yet</div>`;
             backContent.innerHTML = '<div class="qh-flashcard-text">—</div>';
             backTag.textContent = 'Answer';
             counter.textContent = '0 / 0';
@@ -2188,7 +2460,16 @@
         }
         flashcardIndex = ((flashcardIndex % deck.length) + deck.length) % deck.length;
         const item = deck[flashcardIndex];
-        qEl.textContent = item.question;
+
+        const showImgs = GM_getValue('show-images', true);
+        const imgHtml = (showImgs && item.images && item.images.length)
+            ? `<img class="qh-flashcard-img" src="${escapeHtml(item.images[0])}" alt="" loading="lazy">`
+            : '';
+        frontContent.innerHTML = `
+            ${imgHtml}
+            <div class="qh-flashcard-text" id="qh-flash-q">${escapeHtml(item.question)}</div>
+        `;
+
         counter.textContent = `${flashcardIndex + 1} / ${deck.length}`;
         progress.style.width = (((flashcardIndex + 1) / deck.length) * 100) + '%';
 
@@ -2281,6 +2562,14 @@
         renderPractice();
     }
 
+    function questionHtmlWithImage(q) {
+        const showImgs = GM_getValue('show-images', true);
+        const img = (showImgs && q.images && q.images.length)
+            ? `<img class="qh-q-inline-img" src="${escapeHtml(q.images[0])}" alt="" loading="lazy">`
+            : '';
+        return `${escapeHtml(q.question)}${img}`;
+    }
+
     function renderPractice(reset = false) {
         if (reset) {
             quizModeIndex = 0; quizModeScore = 0; quizModeAnswered = false;
@@ -2330,7 +2619,7 @@
         numEl.textContent = `${quizModeIndex + 1}/${items.length}`;
         scoreEl.textContent = quizModeScore;
         accEl.textContent = quizModeIndex ? Math.round((quizModeScore / quizModeIndex) * 100) + '%' : '—';
-        qEl.textContent = q.question;
+        qEl.innerHTML = questionHtmlWithImage(q);
 
         const correctAnswers = q.answers || [];
         const allOptions = q.allOptions || [];
@@ -2634,16 +2923,25 @@
             return;
         }
 
+        const showImgs = GM_getValue('show-images', true);
         list.innerHTML = wrongs.map(q => {
             const ansJoined = (q.answers || []).join(' • ');
             const when = q.quizizzLastWrong ? new Date(q.quizizzLastWrong).toLocaleString() : '';
+            const thumb = showImgs && q.images && q.images.length
+                ? `<img class="qh-list-thumb" src="${escapeHtml(q.images[0])}" loading="lazy" alt="">`
+                : '';
             return `
             <div class="qh-list-item has-wrongs" data-hash="${q.hash}">
-                <div class="qh-list-q">${escapeHtml(q.question.substring(0, 120))}${q.question.length > 120 ? '…' : ''}</div>
-                <div class="qh-list-a">→ ${escapeHtml(ansJoined.substring(0, 120))}${ansJoined.length > 120 ? '…' : ''}</div>
-                <div class="qh-list-meta">
-                    <span class="qh-list-meta-wrong">✕ ${q.quizizzWrongCount}× wrong</span>
-                    ${when ? `<span>${escapeHtml(when)}</span>` : ''}
+                <div class="qh-list-item-row">
+                    ${thumb}
+                    <div style="flex:1;min-width:0">
+                        <div class="qh-list-q">${escapeHtml(q.question.substring(0, 120))}${q.question.length > 120 ? '…' : ''}</div>
+                        <div class="qh-list-a">→ ${escapeHtml(ansJoined.substring(0, 120))}${ansJoined.length > 120 ? '…' : ''}</div>
+                        <div class="qh-list-meta">
+                            <span class="qh-list-meta-wrong">✕ ${q.quizizzWrongCount}× wrong</span>
+                            ${when ? `<span>${escapeHtml(when)}</span>` : ''}
+                        </div>
+                    </div>
                 </div>
             </div>`;
         }).join('');
@@ -2713,7 +3011,7 @@
         }
 
         const q = quizizzPracticeDeck[quizizzPracticeIndex];
-        qEl.innerHTML = `<div style="font-size:10px;color:var(--qh-error);font-weight:700;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:6px">Quizizz Wrong • ${quizizzPracticeIndex + 1}/${quizizzPracticeDeck.length}</div>${escapeHtml(q.question)}`;
+        qEl.innerHTML = `<div style="font-size:10px;color:var(--qh-error);font-weight:700;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:6px">Quizizz Wrong • ${quizizzPracticeIndex + 1}/${quizizzPracticeDeck.length}</div>${questionHtmlWithImage(q)}`;
 
         controls.innerHTML = `
             <button class="qh-btn qh-btn-secondary" id="qh-qz-skip">⏭ Skip</button>
@@ -2809,7 +3107,7 @@
             <div class="qh-custom-item ${isSel ? 'selected' : ''}" data-hash="${q.hash}">
                 <div class="qh-custom-checkbox">${isSel ? '✓' : ''}</div>
                 <div class="qh-custom-item-body">
-                    <div class="qh-custom-q">${q.starred ? '⭐ ' : ''}${escapeHtml(q.question.substring(0, 100))}${q.question.length > 100 ? '…' : ''}</div>
+                    <div class="qh-custom-q">${q.starred ? '⭐ ' : ''}${q.images && q.images.length ? '🖼 ' : ''}${escapeHtml(q.question.substring(0, 100))}${q.question.length > 100 ? '…' : ''}</div>
                     <div class="qh-custom-a">→ ${escapeHtml(ansJoined.substring(0, 100))}${ansJoined.length > 100 ? '…' : ''}</div>
                 </div>
             </div>`;
@@ -2907,6 +3205,11 @@
                 </div>`;
         }
 
+        const showImgs = GM_getValue('show-images', true);
+        const imgHtml = (showImgs && item.images && item.images.length)
+            ? `<img class="qh-flashcard-img" src="${escapeHtml(item.images[0])}" alt="" loading="lazy">`
+            : '';
+
         body.innerHTML = `
             <div class="qh-flashcard-controls">
                 <button class="qh-icon-btn" id="qh-cf-prev">‹</button>
@@ -2918,7 +3221,10 @@
                 <div class="qh-flashcard-inner">
                     <div class="qh-flashcard-face front">
                         <div class="qh-flashcard-tag">Question</div>
-                        <div class="qh-flashcard-text">${escapeHtml(item.question)}</div>
+                        <div style="width:100%;flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:6px">
+                            ${imgHtml}
+                            <div class="qh-flashcard-text">${escapeHtml(item.question)}</div>
+                        </div>
                         <div class="qh-flashcard-hint">Click to flip</div>
                     </div>
                     <div class="qh-flashcard-face back">
@@ -3019,7 +3325,7 @@
                     <div class="qh-stat-value" style="font-size:16px">${acc}</div>
                 </div>
             </div>
-            <div class="qh-quiz-question">${escapeHtml(q.question)}</div>
+            <div class="qh-quiz-question">${questionHtmlWithImage(q)}</div>
             <div id="qh-cp-body"></div>
             <div class="qh-btn-row">
                 <button class="qh-btn qh-btn-secondary" id="qh-cp-skip">⏭ Skip</button>
@@ -3242,7 +3548,7 @@
             e.stopPropagation();
             flashcardFilter = flashcardFilter === 'hard' ? 'all' : 'hard';
             flashcardIndex = 0; flashcardFlipped = false;
-            flashcardOrder = null; // reset shuffle when filter changes
+            flashcardOrder = null;
             e.target.textContent = flashcardFilter === 'hard' ? '📚 All cards' : '🔥 Hard only';
             renderFlashcard();
         };
@@ -3278,7 +3584,6 @@
             showNotification('Cleared Quizizz wrongs', 'success');
         };
 
-        // Custom tab wiring
         document.getElementById('qh-custom-search').addEventListener('input', e => {
             customSearch = e.target.value;
             renderCustomPicker();
@@ -3370,6 +3675,12 @@
             GM_setValue('floating-card', e.target.checked);
             if (!e.target.checked) hideFloatingAnswer();
         });
+        document.getElementById('qh-images-toggle').addEventListener('change', e => {
+            GM_setValue('show-images', e.target.checked);
+            if (currentMatch) markCorrectAnswers(currentMatch, currentQuestionText, true);
+            renderStudyList(document.getElementById('qh-search-input')?.value || '');
+            renderFlashcard();
+        });
         document.getElementById('qh-sound-toggle').addEventListener('change', e => {
             GM_setValue('sounds', e.target.checked);
             if (e.target.checked) playBeep('success');
@@ -3397,12 +3708,17 @@
                     document.getElementById('qh-flashcard').click();
                 }
             }
+            if (e.key === 'Escape') {
+                const lb = document.getElementById('qh-img-lightbox');
+                if (lb && lb.classList.contains('show')) lb.classList.remove('show');
+            }
         });
     }
 
     function initialize() {
         log(`Init v${VERSION}`);
         createGUI();
+        ensureLightbox();
         setupShortcuts();
         updateTabBadges();
         updateWrongCount();
